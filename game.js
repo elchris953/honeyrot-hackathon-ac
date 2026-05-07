@@ -21,7 +21,10 @@ const PETAL_DROP_BASE_RATE = 0.00005;
 const PETAL_PARTICLE_LIFE = 1500;
 const MAX_PETAL_PARTICLES = 120;
 const REVIVE_DURATION = 2500;
+const REVIVE_DIFFICULTY_SLOWDOWN = 1700;
 const FLOWER_RESET_SCORE = 1;
+const COMBO_POP_LIFE = 900;
+const FIRST_DECAY_DELAY = 900;
 const RANDOM_DECAY_INTERVAL = 3200;
 const RANDOM_DECAY_VARIANCE = 1700;
 const INITIAL_CLUSTERS_MIN = 2;
@@ -78,6 +81,15 @@ const restartButton = document.getElementById("restart");
 canvas.width = GRID_SIZE * TILE_SIZE;
 canvas.height = GRID_SIZE * TILE_SIZE;
 
+const audio = {
+  context: null,
+  master: null,
+  musicGain: null,
+  musicTimer: null,
+  musicStep: 0,
+  enabled: false
+};
+
 // Central game state. Keeping mutable data in one object makes restart and
 // update/render boundaries easier to reason about.
 const state = {
@@ -89,6 +101,11 @@ const state = {
   particles: [],
   petalParticles: [],
   floatingTexts: [],
+  comboPops: [],
+  combo: {
+    count: 0,
+    streakKeys: new Set()
+  },
   score: 0,
   lastTime: 0,
   worldTime: 0,
@@ -119,6 +136,11 @@ function resetGame(nextMode = "playing", difficultyName = state.selectedDifficul
   state.particles = [];
   state.petalParticles = [];
   state.floatingTexts = [];
+  state.comboPops = [];
+  state.combo = {
+    count: 0,
+    streakKeys: new Set()
+  };
   state.score = 0;
   state.lastTime = 0;
   state.worldTime = 0;
@@ -126,7 +148,7 @@ function resetGame(nextMode = "playing", difficultyName = state.selectedDifficul
   state.spawnTimer = 0;
   state.spawnInterval = INITIAL_SPAWN_INTERVAL;
   state.decayTimer = 0;
-  state.nextDecayAt = getNextRandomDecayDelay();
+  state.nextDecayAt = FIRST_DECAY_DELAY;
   state.witherTimer = 0;
   state.nextWitherAt = getNextWitherDelay();
   state.spawnInterval = getCurrentSpawnInterval();
@@ -184,12 +206,14 @@ function handleKeyDown(event) {
   }
 
   if (key === "r") {
+    ensureAudio();
     resetGame("playing");
     return;
   }
 
   if ((key === " " || key === "enter") && state.mode === "gameover") {
     event.preventDefault();
+    ensureAudio();
     resetGame("playing");
     return;
   }
@@ -217,6 +241,7 @@ function getDifficultyFromKey(key) {
 }
 
 function startGame(difficultyName) {
+  ensureAudio();
   resetGame("playing", difficultyName);
 }
 
@@ -351,13 +376,14 @@ function updateReviveSystem(deltaTime) {
       x: flower.x,
       y: flower.y,
       progress: 0,
+      duration: getCurrentReviveDuration(),
       shouldScore: isFlowerDamaged(flower)
     };
   }
 
   state.revive.progress += deltaTime;
 
-  if (state.revive.progress >= REVIVE_DURATION) {
+  if (state.revive.progress >= state.revive.duration) {
     completeFlowerRevive(flower, state.revive.shouldScore);
     state.revive = null;
   }
@@ -374,6 +400,8 @@ function completeFlowerRevive(flower, shouldScore) {
   if (shouldScore) {
     state.score += FLOWER_RESET_SCORE;
     addFloatingText(center.x, center.y, "+1 revive");
+    addComboPop(center.x, center.y, flower);
+    playReviveSound(state.combo.count);
   }
 
   addParticleBurst(center.x, center.y);
@@ -383,10 +411,18 @@ function resetReviveProgress() {
   state.revive = null;
 }
 
+function getCurrentReviveDuration() {
+  const ramp = getDifficultyRamp();
+  const difficultyPressure = getDifficultyConfig().decayMultiplier;
+
+  return REVIVE_DURATION + REVIVE_DIFFICULTY_SLOWDOWN * ramp * difficultyPressure;
+}
+
 function turnFlowerRotten(flowerIndex) {
   const flower = state.flowers[flowerIndex];
 
   state.flowers.splice(flowerIndex, 1);
+  breakComboIfStreakFlowerFalls(flower);
 
   if (state.rottenFlowers.length < MAX_ROT && !hasRottenFlowerAt(flower.x, flower.y)) {
     state.rottenFlowers.push({
@@ -397,6 +433,7 @@ function turnFlowerRotten(flowerIndex) {
   }
 
   state.screenShakeTimer = SCREEN_SHAKE_TIME;
+  playRotSound();
 }
 
 // ---------------------------------------------------------------------------
@@ -580,6 +617,7 @@ function startRandomFlowerDecay() {
 
   const flower = candidates[Math.floor(Math.random() * candidates.length)];
   flower.decaying = true;
+  breakComboIfStreakFlowerFalls(flower);
 }
 
 function witherRandomFlower() {
@@ -595,10 +633,12 @@ function witherRandomFlower() {
 
   const flower = candidates[Math.floor(Math.random() * candidates.length)];
   flower.decaying = true;
+  breakComboIfStreakFlowerFalls(flower);
   flower.witheredUntil = state.gameplayTime + WITHER_DURATION;
 
   const center = getTileCenter(flower.x, flower.y);
   addFloatingText(center.x, center.y, "wither!");
+  playWitherSound();
 }
 
 function countDecayingFlowers() {
@@ -649,6 +689,10 @@ function isFlowerWithered(flower) {
 }
 
 function shouldFlowerDecay(flower) {
+  if (isRevivingFlower(flower)) {
+    return false;
+  }
+
   return flower.decaying || isFlowerWithered(flower);
 }
 
@@ -660,6 +704,7 @@ function updateEffects(deltaTime) {
   updateParticles(deltaTime);
   updatePetalParticles(deltaTime);
   updateFloatingTexts(deltaTime);
+  updateComboPops(deltaTime);
 }
 
 function updateParticles(deltaTime) {
@@ -671,7 +716,7 @@ function updateParticles(deltaTime) {
     particle.vy += 0.0007 * deltaTime;
 
     if (particle.age >= particle.life) {
-      state.particles.splice(i, 1);
+  state.particles.splice(i, 1);
     }
   }
 }
@@ -703,6 +748,18 @@ function updateFloatingTexts(deltaTime) {
   }
 }
 
+function updateComboPops(deltaTime) {
+  for (let i = state.comboPops.length - 1; i >= 0; i--) {
+    const pop = state.comboPops[i];
+    pop.age += deltaTime;
+    pop.y -= 0.025 * deltaTime;
+
+    if (pop.age >= pop.life) {
+      state.comboPops.splice(i, 1);
+    }
+  }
+}
+
 function addFloatingText(x, y, text) {
   state.floatingTexts.push({
     x,
@@ -711,6 +768,33 @@ function addFloatingText(x, y, text) {
     age: 0,
     life: FLOATING_TEXT_LIFE
   });
+}
+
+function addComboPop(x, y, flower) {
+  state.combo.count += 1;
+  state.combo.streakKeys.add(getTileKey(flower.x, flower.y));
+
+  if (state.combo.count < 2) {
+    return;
+  }
+
+  state.comboPops.push({
+    x,
+    y: y + 28,
+    count: state.combo.count,
+    age: 0,
+    life: COMBO_POP_LIFE
+  });
+}
+
+function breakComboIfStreakFlowerFalls(flower) {
+  if (!state.combo.streakKeys.has(getTileKey(flower.x, flower.y))) {
+    return;
+  }
+
+  state.combo.count = 0;
+  state.combo.streakKeys.clear();
+  state.comboPops = [];
 }
 
 function addParticleBurst(x, y) {
@@ -724,7 +808,7 @@ function addParticleBurst(x, y) {
       vx: Math.cos(angle) * speed,
       vy: Math.sin(angle) * speed - 0.035,
       radius: 2 + Math.random() * 3,
-      color: Math.random() > 0.45 ? "#ffe84d" : "#fff3a3",
+      color: Math.random() > 0.45 ? "#ffef5a" : "#fff7b8",
       age: 0,
       life: PARTICLE_LIFE + Math.random() * 180
     });
@@ -769,6 +853,102 @@ function addFallingPetal(flower, color) {
 }
 
 // ---------------------------------------------------------------------------
+// Audio
+// ---------------------------------------------------------------------------
+
+function ensureAudio() {
+  if (!audio.context) {
+    const AudioContext = window.AudioContext || window.webkitAudioContext;
+
+    if (!AudioContext) {
+      return;
+    }
+
+    audio.context = new AudioContext();
+    audio.master = audio.context.createGain();
+    audio.master.gain.value = 0.38;
+    audio.master.connect(audio.context.destination);
+
+    audio.musicGain = audio.context.createGain();
+    audio.musicGain.gain.value = 0.18;
+    audio.musicGain.connect(audio.master);
+  }
+
+  if (audio.context.state === "suspended") {
+    audio.context.resume().then(() => {
+      if (!audio.enabled) {
+        audio.enabled = true;
+        startBackgroundMusic();
+      }
+    }).catch(() => {});
+    return;
+  }
+
+  if (!audio.enabled) {
+    audio.enabled = true;
+    startBackgroundMusic();
+  }
+}
+
+function startBackgroundMusic() {
+  if (!audio.context || audio.musicTimer) {
+    return;
+  }
+
+  const notes = [261.63, 329.63, 392, 523.25, 392, 329.63, 293.66, 349.23];
+
+  audio.musicTimer = setInterval(() => {
+    if (state.mode !== "playing" || !audio.context) {
+      return;
+    }
+
+    const frequency = notes[audio.musicStep % notes.length];
+    playTone(frequency, 0.18, 0.07, "sine", audio.musicGain);
+
+    if (audio.musicStep % 2 === 0) {
+      playTone(frequency / 2, 0.32, 0.045, "triangle", audio.musicGain);
+    }
+
+    audio.musicStep += 1;
+  }, 420);
+}
+
+function playReviveSound(comboCount) {
+  const lift = Math.min(comboCount, 6) * 22;
+  playTone(660 + lift, 0.08, 0.26, "sine", audio.master);
+  playTone(990 + lift, 0.14, 0.16, "triangle", audio.master);
+}
+
+function playWitherSound() {
+  playTone(180, 0.18, 0.15, "sawtooth", audio.master);
+}
+
+function playRotSound() {
+  playTone(96, 0.34, 0.23, "sawtooth", audio.master);
+}
+
+function playTone(frequency, duration, volume, type, destination) {
+  if (!audio.context || !destination) {
+    return;
+  }
+
+  const oscillator = audio.context.createOscillator();
+  const gain = audio.context.createGain();
+  const now = audio.context.currentTime;
+
+  oscillator.type = type;
+  oscillator.frequency.setValueAtTime(frequency, now);
+  gain.gain.setValueAtTime(0.0001, now);
+  gain.gain.exponentialRampToValueAtTime(Math.max(0.0001, volume), now + 0.018);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+
+  oscillator.connect(gain);
+  gain.connect(destination);
+  oscillator.start(now);
+  oscillator.stop(now + duration + 0.03);
+}
+
+// ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
 
@@ -784,6 +964,7 @@ function renderGame() {
   drawParticles();
   drawBee();
   drawFloatingTexts();
+  drawComboPops();
   ctx.restore();
 
   if (state.mode === "difficulty") {
@@ -865,7 +1046,7 @@ function drawFlowers() {
     }
 
     if (isRevivingFlower(flower)) {
-      drawReviveProgressRing(center.x, center.y, state.revive.progress / REVIVE_DURATION);
+      drawReviveProgressRing(center.x, center.y, state.revive.progress / state.revive.duration);
     }
 
     for (let i = 0; i < PETAL_COUNT; i++) {
@@ -888,17 +1069,16 @@ function drawFlowers() {
       );
     }
 
-    drawCircle(center.x, center.y, 9 + spawnPulse * 2, blendColors("#fff3a3", petalColor, 0.3));
-    drawLifeBar(flower.x, flower.y, lifeRatio);
+    drawCircle(center.x, center.y, 9 + spawnPulse * 2, blendColors("#ffd447", petalColor, 0.24));
   });
 }
 
 function getFlowerDecayColor(lifeRatio) {
   const stages = [
-    { stop: 1, color: "#ffe84d" },
-    { stop: 0.68, color: "#ff9f1c" },
-    { stop: 0.34, color: "#9f5a2d" },
-    { stop: 0, color: "#5f646c" }
+    { stop: 1, color: "#ffef5a" },
+    { stop: 0.7, color: "#ffb02e" },
+    { stop: 0.36, color: "#a86632" },
+    { stop: 0, color: "#62686f" }
   ];
 
   for (let i = 0; i < stages.length - 1; i++) {
@@ -943,10 +1123,17 @@ function drawPetal(x, y, width, height, rotation, color) {
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(rotation);
-  ctx.fillStyle = color;
+  const gradient = ctx.createLinearGradient(-width / 2, -height / 2, width / 2, height / 2);
+  gradient.addColorStop(0, blendColors("#ffffff", color, 0.28));
+  gradient.addColorStop(0.52, color);
+  gradient.addColorStop(1, blendColors("#332018", color, 0.72));
+  ctx.fillStyle = gradient;
   ctx.beginPath();
   ctx.ellipse(0, 0, width / 2, height / 2, 0, 0, Math.PI * 2);
   ctx.fill();
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.18)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
   ctx.restore();
 }
 
@@ -1000,17 +1187,6 @@ function drawStem(centerX, centerY) {
   ctx.moveTo(centerX, centerY + 6);
   ctx.lineTo(centerX, centerY + 27);
   ctx.stroke();
-}
-
-function drawLifeBar(tileX, tileY, ratio) {
-  const x = tileX * TILE_SIZE + 14;
-  const y = tileY * TILE_SIZE + TILE_SIZE - 14;
-  const width = TILE_SIZE - 28;
-
-  ctx.fillStyle = "rgba(26, 18, 14, 0.56)";
-  ctx.fillRect(x, y, width, 6);
-  ctx.fillStyle = ratio > 0.4 ? "#8ee05d" : "#ef8354";
-  ctx.fillRect(x, y, width * ratio, 6);
 }
 
 function drawRottenFlowers() {
@@ -1150,6 +1326,28 @@ function drawFloatingTexts() {
   });
 }
 
+function drawComboPops() {
+  state.comboPops.forEach((pop) => {
+    const progress = pop.age / pop.life;
+    const scale = 1 + Math.sin(progress * Math.PI) * 0.28;
+
+    ctx.save();
+    ctx.translate(pop.x, pop.y);
+    ctx.scale(scale, scale);
+    ctx.globalAlpha = 1 - progress;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.font = "900 22px system-ui, sans-serif";
+    ctx.strokeStyle = "rgba(35, 18, 10, 0.86)";
+    ctx.fillStyle = "#ffef5a";
+    ctx.lineWidth = 5;
+    ctx.strokeText(`COMBO x${pop.count}`, 0, 0);
+    ctx.fillText(`COMBO x${pop.count}`, 0, 0);
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  });
+}
+
 function drawDifficultyScreen() {
   ctx.fillStyle = "rgba(20, 12, 15, 0.82)";
   ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -1190,7 +1388,7 @@ function drawDifficultyScreen() {
 
   ctx.fillStyle = "#fff7d1";
   ctx.font = "700 17px system-ui, sans-serif";
-  ctx.fillText("Click a difficulty or press 1, 2, 3", canvas.width / 2, 526);
+  ctx.fillText("Click a difficulty or press 1, 2, 3", canvas.width / 2, 542);
 }
 
 function drawGameOver() {
@@ -1270,6 +1468,10 @@ function getTileCenter(x, y) {
   };
 }
 
+function getTileKey(x, y) {
+  return `${x},${y}`;
+}
+
 function getNeighborTiles(x, y) {
   const tiles = [];
 
@@ -1324,15 +1526,31 @@ function drawCircle(x, y, radius, color) {
   ctx.fill();
 }
 
-function blendColors(startHex, endHex, amount) {
-  const start = hexToRgb(startHex);
-  const end = hexToRgb(endHex);
+function blendColors(startColor, endColor, amount) {
+  const start = parseColor(startColor);
+  const end = parseColor(endColor);
   const clampedAmount = clamp(amount, 0, 1);
   const r = Math.round(start.r + (end.r - start.r) * clampedAmount);
   const g = Math.round(start.g + (end.g - start.g) * clampedAmount);
   const b = Math.round(start.b + (end.b - start.b) * clampedAmount);
 
   return `rgb(${r}, ${g}, ${b})`;
+}
+
+function parseColor(color) {
+  if (color.startsWith("rgb")) {
+    const values = color.match(/\d+/g);
+
+    if (values && values.length >= 3) {
+      return {
+        r: Number(values[0]),
+        g: Number(values[1]),
+        b: Number(values[2])
+      };
+    }
+  }
+
+  return hexToRgb(color);
 }
 
 function hexToRgb(hex) {
@@ -1400,11 +1618,15 @@ canvas.addEventListener("click", (event) => {
   }
 
   if (state.mode === "gameover") {
+    ensureAudio();
     resetGame("playing");
   }
 });
 
-restartButton.addEventListener("click", () => resetGame("playing"));
+restartButton.addEventListener("click", () => {
+  ensureAudio();
+  resetGame("playing");
+});
 
 resetGame("difficulty");
 requestAnimationFrame(gameLoop);
