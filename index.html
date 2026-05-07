@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Honeyrot</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="game-shell">
+    <section class="game-panel" aria-label="Honeyrot game">
+      <div class="hud">
+        <div>
+          <p class="label">Score</p>
+          <p id="score" class="value">0</p>
+        </div>
+        <div>
+          <h1>Honeyrot</h1>
+          <p class="subtitle">WASD or arrow keys to move</p>
+        </div>
+        <div>
+          <p class="label">Rot</p>
+          <p id="rot-count" class="value">0 / 8</p>
+        </div>
+        <div>
+          <p class="label">Time</p>
+          <p id="time" class="value">0:00</p>
+        </div>
+        <div>
+          <p class="label">Difficulty</p>
+          <p id="difficulty" class="value">-</p>
+        </div>
+      </div>
+
+      <canvas id="game" width="640" height="640" aria-label="Honeyrot canvas"></canvas>
+
+      <div class="controls">
+        <button id="restart" type="button">Restart</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="game.js"></script>
+</body>
+</html>
