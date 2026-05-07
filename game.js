@@ -12,11 +12,18 @@ const FLOATING_TEXT_LIFE = 900;
 const PARTICLE_LIFE = 520;
 const WITHER_DURATION = 7800;
 const WITHERED_DECAY_MULTIPLIER = 2.35;
-const STARTING_FLOWER_DENSITY = 0.84;
+const STARTING_FLOWER_DENSITY = 1;
+const MAX_DECAYING_FLOWERS = 15;
+const DECAY_LIMIT_RAMP_START = 120000;
+const DECAY_LIMIT_RAMP_DURATION = 180000;
 const PETAL_COUNT = 8;
-const PETAL_FALL_RATE = 0.00005;
+const PETAL_DROP_BASE_RATE = 0.00005;
 const PETAL_PARTICLE_LIFE = 1500;
+const MAX_PETAL_PARTICLES = 120;
+const REVIVE_DURATION = 2500;
 const FLOWER_RESET_SCORE = 1;
+const RANDOM_DECAY_INTERVAL = 3200;
+const RANDOM_DECAY_VARIANCE = 1700;
 const INITIAL_CLUSTERS_MIN = 2;
 const INITIAL_CLUSTERS_MAX = 3;
 const CLUSTER_SIZE_MIN = 3;
@@ -29,6 +36,8 @@ const DIFFICULTIES = {
     rampDuration: 130000,
     clusterChance: 0.24,
     clusterDecayMultiplier: 0.055,
+    startingDecayLimit: 2,
+    finalDecayLimit: 9,
     witherInterval: 11000,
     witherVariance: 4500
   },
@@ -38,6 +47,8 @@ const DIFFICULTIES = {
     rampDuration: 105000,
     clusterChance: 0.42,
     clusterDecayMultiplier: 0.08,
+    startingDecayLimit: 3,
+    finalDecayLimit: 12,
     witherInterval: 8200,
     witherVariance: 3400
   },
@@ -47,6 +58,8 @@ const DIFFICULTIES = {
     rampDuration: 80000,
     clusterChance: 0.62,
     clusterDecayMultiplier: 0.11,
+    startingDecayLimit: 4,
+    finalDecayLimit: 15,
     witherInterval: 5800,
     witherVariance: 2600
   }
@@ -82,8 +95,11 @@ const state = {
   gameplayTime: 0,
   spawnTimer: 0,
   spawnInterval: INITIAL_SPAWN_INTERVAL,
+  decayTimer: 0,
+  nextDecayAt: 0,
   witherTimer: 0,
   nextWitherAt: 0,
+  revive: null,
   screenShakeTimer: 0
 };
 
@@ -109,9 +125,12 @@ function resetGame(nextMode = "playing", difficultyName = state.selectedDifficul
   state.gameplayTime = 0;
   state.spawnTimer = 0;
   state.spawnInterval = INITIAL_SPAWN_INTERVAL;
+  state.decayTimer = 0;
+  state.nextDecayAt = getNextRandomDecayDelay();
   state.witherTimer = 0;
   state.nextWitherAt = getNextWitherDelay();
   state.spawnInterval = getCurrentSpawnInterval();
+  state.revive = null;
   state.screenShakeTimer = 0;
 
   if (nextMode === "playing") {
@@ -230,7 +249,7 @@ function moveBee(dx, dy) {
 
   state.bee.x = nextX;
   state.bee.y = nextY;
-  pollinateFlowerAt(nextX, nextY);
+  resetReviveProgress();
   updateHud();
 }
 
@@ -242,7 +261,9 @@ function updateGame(deltaTime) {
   state.gameplayTime += deltaTime;
 
   updateSpawnSystem(deltaTime);
+  updateRandomDecaySystem(deltaTime);
   updateWitherSystem(deltaTime);
+  updateReviveSystem(deltaTime);
   updateFlowers(deltaTime);
 
   if (state.rottenFlowers.length >= MAX_ROT) {
@@ -270,11 +291,14 @@ function updateSpawnSystem(deltaTime) {
 function updateFlowers(deltaTime) {
   for (let i = state.flowers.length - 1; i >= 0; i--) {
     const flower = state.flowers[i];
-    const decayRate = getFlowerDecayRate(flower);
 
     flower.age += deltaTime;
-    flower.currentLife -= decayRate * (deltaTime / 1000);
-    maybeShedPetal(flower, deltaTime);
+
+    if (shouldFlowerDecay(flower)) {
+      const decayRate = getFlowerDecayRate(flower);
+      flower.currentLife -= decayRate * (deltaTime / 1000);
+      maybeShedPetal(flower, deltaTime);
+    }
 
     if (isFlowerWithered(flower) && state.gameplayTime >= flower.witheredUntil) {
       flower.witheredUntil = 0;
@@ -284,6 +308,18 @@ function updateFlowers(deltaTime) {
       turnFlowerRotten(i);
     }
   }
+}
+
+function updateRandomDecaySystem(deltaTime) {
+  state.decayTimer += deltaTime;
+
+  if (state.decayTimer < state.nextDecayAt) {
+    return;
+  }
+
+  state.decayTimer = 0;
+  state.nextDecayAt = getNextRandomDecayDelay();
+  startRandomFlowerDecay();
 }
 
 function updateWitherSystem(deltaTime) {
@@ -298,21 +334,53 @@ function updateWitherSystem(deltaTime) {
   witherRandomFlower();
 }
 
-function pollinateFlowerAt(x, y) {
-  const flowerIndex = state.flowers.findIndex((flower) => flower.x === x && flower.y === y);
-  if (flowerIndex === -1) {
+function updateReviveSystem(deltaTime) {
+  if (hasRottenFlowerAt(state.bee.x, state.bee.y)) {
+    resetReviveProgress();
     return;
   }
 
-  const flower = state.flowers[flowerIndex];
+  const flower = getFlowerAt(state.bee.x, state.bee.y);
+  if (!flower || !isFlowerDamaged(flower)) {
+    resetReviveProgress();
+    return;
+  }
+
+  if (!state.revive || state.revive.x !== flower.x || state.revive.y !== flower.y) {
+    state.revive = {
+      x: flower.x,
+      y: flower.y,
+      progress: 0,
+      shouldScore: isFlowerDamaged(flower)
+    };
+  }
+
+  state.revive.progress += deltaTime;
+
+  if (state.revive.progress >= REVIVE_DURATION) {
+    completeFlowerRevive(flower, state.revive.shouldScore);
+    state.revive = null;
+  }
+}
+
+function completeFlowerRevive(flower, shouldScore) {
   const center = getTileCenter(flower.x, flower.y);
 
   flower.currentLife = flower.maxLife;
   flower.age = 0;
+  flower.decaying = false;
   flower.witheredUntil = 0;
-  state.score += FLOWER_RESET_SCORE;
-  addFloatingText(center.x, center.y, "+1 nectar");
+
+  if (shouldScore) {
+    state.score += FLOWER_RESET_SCORE;
+    addFloatingText(center.x, center.y, "+1 revive");
+  }
+
   addParticleBurst(center.x, center.y);
+}
+
+function resetReviveProgress() {
+  state.revive = null;
 }
 
 function turnFlowerRotten(flowerIndex) {
@@ -337,14 +405,9 @@ function turnFlowerRotten(flowerIndex) {
 
 function seedStartingGarden() {
   const targetFlowerCount = Math.floor((GRID_SIZE * GRID_SIZE - 1) * STARTING_FLOWER_DENSITY);
-  const clusters = randomInt(INITIAL_CLUSTERS_MIN, INITIAL_CLUSTERS_MAX);
-
-  for (let i = 0; i < clusters && state.flowers.length < targetFlowerCount; i++) {
-    spawnFlowerCluster(randomInt(CLUSTER_SIZE_MIN, CLUSTER_SIZE_MAX), true);
-  }
 
   while (state.flowers.length < targetFlowerCount && spawnSingleFlower(true)) {
-    // Keep filling the garden with healthy flowers while preserving the bee tile.
+    // Fill every valid tile with healthy flowers while preserving the bee tile.
   }
 }
 
@@ -422,6 +485,7 @@ function createFlower(x, y, isInitial = false) {
     maxLife,
     currentLife: maxLife,
     age: isInitial ? FLOWER_SPAWN_PULSE_TIME : 0,
+    decaying: false,
     witheredUntil: 0
   };
 }
@@ -487,6 +551,14 @@ function getFlowerDecayRate(flower) {
   return (getBaseDecayRate() + adjacentRot * getRotDecayBonus()) * (1 + clusterBonus) * witherBonus;
 }
 
+function getNextRandomDecayDelay() {
+  const ramp = getDifficultyRamp();
+  const softStart = state.gameplayTime < 25000 ? 1.8 : 1;
+  const pressureDelay = RANDOM_DECAY_INTERVAL * (1 - ramp * 0.45) * getDifficultyConfig().spawnMultiplier * softStart;
+
+  return Math.max(1300, pressureDelay + randomBetween(-RANDOM_DECAY_VARIANCE, RANDOM_DECAY_VARIANCE));
+}
+
 function getNextWitherDelay() {
   const config = getDifficultyConfig();
   const ramp = getDifficultyRamp();
@@ -495,18 +567,51 @@ function getNextWitherDelay() {
   return Math.max(2200, pressureDelay + randomBetween(-config.witherVariance, config.witherVariance));
 }
 
-function witherRandomFlower() {
-  const candidates = state.flowers.filter((flower) => !isFlowerWithered(flower));
+function startRandomFlowerDecay() {
+  if (countDecayingFlowers() >= getMaxDecayingFlowers()) {
+    return;
+  }
+
+  const candidates = state.flowers.filter((flower) => !flower.decaying && !isFlowerWithered(flower));
 
   if (candidates.length === 0) {
     return;
   }
 
   const flower = candidates[Math.floor(Math.random() * candidates.length)];
+  flower.decaying = true;
+}
+
+function witherRandomFlower() {
+  if (countDecayingFlowers() >= getMaxDecayingFlowers()) {
+    return;
+  }
+
+  const candidates = state.flowers.filter((flower) => !flower.decaying && !isFlowerWithered(flower));
+
+  if (candidates.length === 0) {
+    return;
+  }
+
+  const flower = candidates[Math.floor(Math.random() * candidates.length)];
+  flower.decaying = true;
   flower.witheredUntil = state.gameplayTime + WITHER_DURATION;
 
   const center = getTileCenter(flower.x, flower.y);
   addFloatingText(center.x, center.y, "wither!");
+}
+
+function countDecayingFlowers() {
+  return state.flowers.filter((flower) => shouldFlowerDecay(flower)).length;
+}
+
+function getMaxDecayingFlowers() {
+  const config = getDifficultyConfig();
+  const ramp = clamp((state.gameplayTime - DECAY_LIMIT_RAMP_START) / DECAY_LIMIT_RAMP_DURATION, 0, 1);
+  const easedRamp = easeInOutCubic(ramp);
+  const limit = Math.round(config.startingDecayLimit + (config.finalDecayLimit - config.startingDecayLimit) * easedRamp);
+
+  return Math.min(MAX_DECAYING_FLOWERS, limit);
 }
 
 function countAdjacentRottenFlowers(x, y) {
@@ -541,6 +646,10 @@ function countAdjacentFlowers(x, y) {
 
 function isFlowerWithered(flower) {
   return flower.witheredUntil > state.gameplayTime;
+}
+
+function shouldFlowerDecay(flower) {
+  return flower.decaying || isFlowerWithered(flower);
 }
 
 // ---------------------------------------------------------------------------
@@ -615,7 +724,7 @@ function addParticleBurst(x, y) {
       vx: Math.cos(angle) * speed,
       vy: Math.sin(angle) * speed - 0.035,
       radius: 2 + Math.random() * 3,
-      color: Math.random() > 0.45 ? "#f7d64a" : "#fff2a6",
+      color: Math.random() > 0.45 ? "#ffe84d" : "#fff3a3",
       age: 0,
       life: PARTICLE_LIFE + Math.random() * 180
     });
@@ -631,9 +740,9 @@ function maybeShedPetal(flower, deltaTime) {
   }
 
   const witherBoost = isFlowerWithered(flower) ? 1.8 : 1;
-  const chance = PETAL_FALL_RATE * deltaTime * (0.35 + decayAmount * 2.4) * witherBoost;
+  const chance = PETAL_DROP_BASE_RATE * deltaTime * (0.35 + decayAmount * 2.4) * witherBoost;
 
-  if (Math.random() < chance) {
+  if (state.petalParticles.length < MAX_PETAL_PARTICLES && Math.random() < chance) {
     addFallingPetal(flower, getFlowerDecayColor(lifeRatio));
   }
 }
@@ -755,6 +864,10 @@ function drawFlowers() {
       drawWarningRing(center.x, center.y, warningPulse);
     }
 
+    if (isRevivingFlower(flower)) {
+      drawReviveProgressRing(center.x, center.y, state.revive.progress / REVIVE_DURATION);
+    }
+
     for (let i = 0; i < PETAL_COUNT; i++) {
       if (i >= visiblePetals) {
         continue;
@@ -775,18 +888,17 @@ function drawFlowers() {
       );
     }
 
-    drawCircle(center.x, center.y, 9 + spawnPulse * 2, blendColors("#f7d64a", petalColor, 0.35));
+    drawCircle(center.x, center.y, 9 + spawnPulse * 2, blendColors("#fff3a3", petalColor, 0.3));
     drawLifeBar(flower.x, flower.y, lifeRatio);
-    drawFlowerCountdown(flower, center.x, center.y);
   });
 }
 
 function getFlowerDecayColor(lifeRatio) {
   const stages = [
-    { stop: 1, color: "#f7d64a" },
-    { stop: 0.66, color: "#f08a32" },
-    { stop: 0.33, color: "#7b5433" },
-    { stop: 0, color: "#8d8d86" }
+    { stop: 1, color: "#ffe84d" },
+    { stop: 0.68, color: "#ff9f1c" },
+    { stop: 0.34, color: "#9f5a2d" },
+    { stop: 0, color: "#5f646c" }
   ];
 
   for (let i = 0; i < stages.length - 1; i++) {
@@ -846,6 +958,24 @@ function drawWarningRing(centerX, centerY, pulse) {
   ctx.stroke();
 }
 
+function drawReviveProgressRing(centerX, centerY, progress) {
+  const clampedProgress = clamp(progress, 0, 1);
+
+  ctx.strokeStyle = "rgba(255, 247, 209, 0.34)";
+  ctx.lineWidth = 5;
+  ctx.beginPath();
+  ctx.arc(centerX, centerY, 35, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.strokeStyle = "#f6be34";
+  ctx.lineWidth = 6;
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.arc(centerX, centerY, 35, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * clampedProgress);
+  ctx.stroke();
+  ctx.lineCap = "butt";
+}
+
 function drawWitheredMark(centerX, centerY, pulse) {
   ctx.strokeStyle = `rgba(116, 31, 112, ${0.62 + pulse * 0.26})`;
   ctx.lineWidth = 4;
@@ -881,22 +1011,6 @@ function drawLifeBar(tileX, tileY, ratio) {
   ctx.fillRect(x, y, width, 6);
   ctx.fillStyle = ratio > 0.4 ? "#8ee05d" : "#ef8354";
   ctx.fillRect(x, y, width * ratio, 6);
-}
-
-function drawFlowerCountdown(flower, centerX, centerY) {
-  const secondsLeft = Math.max(0, Math.ceil(flower.currentLife / getFlowerDecayRate(flower)));
-  const y = centerY - 1;
-
-  ctx.fillStyle = "rgba(24, 15, 10, 0.78)";
-  ctx.beginPath();
-  ctx.roundRect(centerX - 13, y - 12, 26, 20, 5);
-  ctx.fill();
-
-  ctx.fillStyle = "#fff7d1";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.font = "800 13px system-ui, sans-serif";
-  ctx.fillText(String(secondsLeft), centerX, y - 1);
 }
 
 function drawRottenFlowers() {
@@ -1052,8 +1166,8 @@ function drawDifficultyScreen() {
 
   ctx.fillStyle = "rgba(255, 247, 209, 0.82)";
   ctx.font = "600 15px system-ui, sans-serif";
-  ctx.fillText("Singles and clusters appear over time. Clustered flowers decay faster together.", canvas.width / 2, 222);
-  ctx.fillText("Random wither marks accelerate decay. Pollinate before rot takes root.", canvas.width / 2, 246);
+  ctx.fillText("Hold still on a damaged flower to revive it before petals fall away.", canvas.width / 2, 222);
+  ctx.fillText("Clusters decay faster together. Random wither marks accelerate decay.", canvas.width / 2, 246);
 
   getDifficultyButtonRects().forEach((button, index) => {
     const isSelected = button.name === state.selectedDifficulty;
@@ -1181,12 +1295,26 @@ function isBeeAt(x, y) {
   return state.bee.x === x && state.bee.y === y;
 }
 
+function getFlowerAt(x, y) {
+  return state.flowers.find((flower) => flower.x === x && flower.y === y);
+}
+
 function hasFlowerAt(x, y) {
   return state.flowers.some((flower) => flower.x === x && flower.y === y);
 }
 
 function hasRottenFlowerAt(x, y) {
   return state.rottenFlowers.some((rot) => rot.x === x && rot.y === y);
+}
+
+function isFlowerDamaged(flower) {
+  return flower.currentLife < flower.maxLife - 0.5 || flower.decaying || isFlowerWithered(flower);
+}
+
+function isRevivingFlower(flower) {
+  return state.revive
+    && state.revive.x === flower.x
+    && state.revive.y === flower.y;
 }
 
 function drawCircle(x, y, radius, color) {
